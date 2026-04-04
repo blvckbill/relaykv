@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	resp "github.com/blvckbill/redis-from-scratch/internal/protocol"
 	"github.com/blvckbill/redis-from-scratch/internal/store"
@@ -18,13 +19,17 @@ type Server struct {
 	aof         *AOFLogger
 	channels    map[string]map[net.Conn]bool
 	pubsubMu    sync.RWMutex
-	isReplaying bool
+	isReplaying atomic.Bool
+	replicas    []net.Conn
+	replicaMu   sync.Mutex
+	isReplica   bool
 }
 
 func NewServer() *Server {
 	var db = store.NewStore()
 	aofLogger, err := NewAOFLogger("appendonly.aof")
 	channels := make(map[string]map[net.Conn]bool)
+	replicas := make([]net.Conn, 0)
 	if err != nil {
 		log.Fatalf("Fatal: could not create AOF logger: %v", err)
 	}
@@ -33,10 +38,11 @@ func NewServer() *Server {
 		store:    db,
 		aof:      aofLogger,
 		channels: channels,
+		replicas: replicas,
 	}
-	s.isReplaying = true
+	s.isReplaying.Store(true)
 	aofLogger.Replay(s)
-	s.isReplaying = false
+	s.isReplaying.Store(false)
 
 	return s
 }
@@ -133,6 +139,14 @@ func (s *Server) commandExecution(conn net.Conn, argv []string) *resp.Resp {
 
 	cmd := strings.ToUpper(argv[0])
 
+	writeCmds := map[string]bool{"SET": true, "DEL": true, "INCR": true, "LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true}
+	if s.isReplica && writeCmds[cmd] {
+		return &resp.Resp{
+			Type: resp.Error,
+			Str:  strPtr("READONLY You can't write against a read only replica"),
+		}
+	}
+
 	var response *resp.Resp
 	switch cmd { // refactor to use interfaces
 	case "PING":
@@ -165,19 +179,22 @@ func (s *Server) commandExecution(conn net.Conn, argv []string) *resp.Resp {
 		response = s.handlePublish(argv[1:])
 	case "UNSUBSCRIBE":
 		return s.handleUnsubscribe(conn, argv[1:])
+	case "REPLICAOF":
+		return s.handleReplicaOf(conn)
 	default:
 		return &resp.Resp{
 			Type: resp.Error,
 			Str:  strPtr("ERR unknown command"),
 		}
 	}
-	if response.Type != resp.Error {
-		cmdBytes := encodeCommand(argv)
-		if !s.isReplaying {
-			if err := s.aof.Append(cmdBytes); err != nil {
-				log.Printf("AOF append error: %v", err)
-			}
+
+	cmdBytes := encodeCommand(argv)
+
+	if !s.isReplaying.Load() {
+		if err := s.aof.Append(cmdBytes); err != nil {
+			log.Printf("AOF append error: %v", err)
 		}
+		s.propagateToReplicas(cmdBytes)
 	}
 
 	return response

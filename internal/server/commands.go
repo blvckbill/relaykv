@@ -1,6 +1,9 @@
 package server
 
 import (
+	"fmt"
+	"io"
+	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -170,7 +173,13 @@ func (s *Server) handleLPush(args []string) *resp.Resp {
 	key := args[0]
 	values := args[1:]
 
-	length := s.store.LPush(key, values...)
+	length, err := s.store.LPush(key, values...)
+	if err != nil {
+		return &resp.Resp{
+			Type: resp.Error,
+			Str:  strPtr(err.Error()),
+		}
+	}
 
 	return &resp.Resp{
 		Type: resp.Integer,
@@ -180,16 +189,19 @@ func (s *Server) handleLPush(args []string) *resp.Resp {
 
 func (s *Server) handleRPush(args []string) *resp.Resp {
 	if len(args) < 2 {
-		return &resp.Resp{
-			Type: resp.Error,
-			Str:  strPtr("ERR wrong number of arguments for 'RPUSH'"),
-		}
+		return &resp.Resp{Type: resp.Error, Str: strPtr("ERR wrong number of arguments")}
 	}
 
 	key := args[0]
 	values := args[1:]
 
-	length := s.store.RPush(key, values...)
+	length, err := s.store.RPush(key, values...)
+	if err != nil {
+		return &resp.Resp{
+			Type: resp.Error,
+			Str:  strPtr(err.Error()),
+		}
+	}
 
 	return &resp.Resp{
 		Type: resp.Integer,
@@ -236,8 +248,8 @@ func (s *Server) handleRPop(args []string) *resp.Resp {
 
 	if !ok {
 		return &resp.Resp{
-			Type: resp.Error,
-			Str:  strPtr("ERR key does not exist"),
+			Type: resp.BulkString,
+			Str:  nil,
 		}
 	}
 
@@ -286,6 +298,9 @@ func (s *Server) handleLRange(args []string) *resp.Resp {
 }
 
 func (s *Server) handleSubscribe(conn net.Conn, args []string) *resp.Resp {
+	if conn == nil {
+		return nil
+	}
 	if len(args) < 1 {
 		return &resp.Resp{
 			Type: resp.Error,
@@ -391,6 +406,9 @@ func (s *Server) handlePublish(args []string) *resp.Resp {
 }
 
 func (s *Server) handleUnsubscribe(conn net.Conn, args []string) *resp.Resp {
+	if conn == nil {
+		return nil
+	}
 	// if no args, unsubscribe from all channels this conn is in
 	if len(args) == 0 {
 		s.pubsubMu.Lock()
@@ -436,4 +454,102 @@ func (s *Server) handleUnsubscribe(conn net.Conn, args []string) *resp.Resp {
 	}
 
 	return nil
+}
+
+func (s *Server) handleReplicaOf(conn net.Conn) *resp.Resp {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+
+	s.replicas = append(s.replicas, conn)
+	return &resp.Resp{
+		Type: resp.SimpleString,
+		Str:  strPtr("OK"),
+	}
+}
+
+func (s *Server) propagateToReplicas(cmd []byte) {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+
+	alive := s.replicas[:0]
+	for _, conn := range s.replicas {
+		_, err := conn.Write(cmd)
+		if err != nil {
+			log.Printf("Replica disconnected: %v", err)
+			conn.Close()
+		} else {
+			alive = append(alive, conn)
+		}
+	}
+	s.replicas = alive
+}
+
+func (s *Server) StartReplication(primaryAddr string) error {
+	// connect to the primary as a client
+	conn, err := net.Dial("tcp", primaryAddr)
+	if err != nil {
+		return fmt.Errorf("could not connect to primary at %s: %v", primaryAddr, err)
+	}
+
+	// tell the primary we want to replicate
+	cmd := encodeCommand([]string{"REPLICAOF"})
+	_, err = conn.Write(cmd)
+	if err != nil {
+		return fmt.Errorf("could not send REPLICAOF to primary: %v", err)
+	}
+	s.isReplica = true
+	// read the OK response back
+	buf := make([]byte, 256)
+	_, err = conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("no response from primary: %v", err)
+	}
+
+	log.Printf("Connected to primary at %s, starting replication", primaryAddr)
+
+	// start a goroutine that reads commands from the primary
+	// and feeds them through commandExecution
+	go s.replicationLoop(conn)
+
+	return nil
+}
+
+func (s *Server) replicationLoop(conn net.Conn) {
+	defer conn.Close()
+
+	readBuf := make([]byte, 4096)
+	var buffer []byte
+
+	for {
+		n, err := conn.Read(readBuf)
+		if err != nil {
+			if err == io.EOF {
+				log.Println("Primary closed the connection")
+			} else {
+				log.Printf("Replication error: %v", err)
+			}
+			return
+		}
+
+		buffer = append(buffer, readBuf[:n]...)
+
+		for {
+			parsed, consumed, ok := resp.Parser(buffer)
+			if !ok {
+				break
+			}
+			buffer = buffer[consumed:]
+
+			argv, ok := ParsedRespToStrings(parsed)
+			if !ok {
+				continue
+			}
+
+			// apply the command locally — pass nil for conn since
+			// replicated commands don't need to write back to anyone
+			s.isReplaying.Store(true)
+			s.commandExecution(nil, argv)
+			s.isReplaying.Store(false)
+		}
+	}
 }

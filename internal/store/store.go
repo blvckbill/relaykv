@@ -215,48 +215,50 @@ func (s *Store) TTL(key string) int64 {
 	return ttl
 }
 
-func (s *Store) LPush(key string, values ...string) int {
+func (s *Store) LPush(key string, values ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	val, ok := s.data[key]
-	if !ok {
-		s.data[key] = Value{
-			encoding: ListEncoding,
-			listVal:  make([]string, 0),
-		}
-		val = s.data[key]
+	val, exists := s.data[key]
+	// 1. Strict Type Check
+	if exists && val.encoding != ListEncoding {
+		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
-	if val.encoding != ListEncoding {
-		log.Printf("ERR WRONGTYPE Operation against a key holding the wrong kind of value")
+	var list []string
+	if exists {
+		list = val.listVal
 	}
-	// prepend values
-	val.listVal = append(values, val.listVal...)
-	s.data[key] = val
-	return len(val.listVal)
+
+	// 2. Prepend values (LPUSH)
+	for _, v := range values {
+		list = append([]string{v}, list...)
+	}
+
+	s.data[key] = Value{encoding: ListEncoding, listVal: list}
+	return len(list), nil
 }
 
-func (s *Store) RPush(key string, values ...string) int {
+func (s *Store) RPush(key string, values ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	val, ok := s.data[key]
-	if !ok {
-		s.data[key] = Value{
-			encoding: ListEncoding,
-			listVal:  make([]string, 0),
-		}
-		val = s.data[key]
+	val, exists := s.data[key]
+	// 1. Strict Type Check
+	if exists && val.encoding != ListEncoding {
+		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
-	if val.encoding != ListEncoding {
-		log.Printf("ERR WRONGTYPE Operation against a key holding the wrong kind of value")
+	var list []string
+	if exists {
+		list = val.listVal
 	}
-	// append values
-	val.listVal = append(val.listVal, values...)
-	s.data[key] = val
-	return len(val.listVal)
+
+	// 2. Append values (RPUSH)
+	list = append(list, values...)
+
+	s.data[key] = Value{encoding: ListEncoding, listVal: list}
+	return len(list), nil
 }
 
 func (s *Store) LPop(key string) (string, bool) {
@@ -286,24 +288,25 @@ func (s *Store) RPop(key string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	val, ok := s.data[key]
-
-	if !ok || val.encoding != ListEncoding || len(val.listVal) == 0 {
+	val, exists := s.data[key]
+	if !exists || val.encoding != ListEncoding || len(val.listVal) == 0 {
 		return "", false
 	}
 
-	idx := len(val.listVal) - 1
-	item := val.listVal[idx]
+	list := val.listVal
+	lastIdx := len(list) - 1
+	popped := list[lastIdx]
 
-	val.listVal = val.listVal[:idx]
-
-	if len(val.listVal) == 0 {
+	// Update or delete if empty
+	if len(list) == 1 {
 		delete(s.data, key)
+		delete(s.indexMap, key) // Cleanup heap/index if necessary
 	} else {
+		val.listVal = list[:lastIdx]
 		s.data[key] = val
 	}
 
-	return item, true
+	return popped, true
 }
 
 func (s *Store) LRange(key string, start, stop int) []string {

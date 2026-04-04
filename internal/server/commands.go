@@ -471,6 +471,8 @@ func (s *Server) propagateToReplicas(cmd []byte) {
 	s.replicaMu.Lock()
 	defer s.replicaMu.Unlock()
 
+	log.Printf("Propagating to %d replicas: %s", len(s.replicas), string(cmd))
+
 	alive := s.replicas[:0]
 	for _, conn := range s.replicas {
 		_, err := conn.Write(cmd)

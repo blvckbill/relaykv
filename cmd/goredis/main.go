@@ -8,6 +8,7 @@ import (
 )
 
 func main() {
+	port := flag.String("port", "6369", "port to listen on")
 	replicaOf := flag.String("replicaof", "", "primary address to replicate from")
 	flag.Parse()
 
@@ -19,5 +20,5 @@ func main() {
 		}
 	}
 
-	s.Start()
+	s.Start("127.0.0.1:" + *port)
 }

@@ -47,8 +47,7 @@ func NewServer() *Server {
 	return s
 }
 
-func (s *Server) Start() {
-	addr := "127.0.0.1:6369"
+func (s *Server) Start(addr string) {
 	// Create a TCP listening socket bound to the address.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
